@@ -64,7 +64,7 @@ func (fos *fileObjectStorage) PutIfAbsent(name string, bytes []byte) error {
 	return nil
 }
 
-func (fos *fileObjectStorage) listPrefix(prefix string) ([]string, error) {
+func (fos *fileObjectStorage) ListPrefix(prefix string) ([]string, error) {
 	dir := path.Join(fos.basedir)
 	f, err := os.Open(dir)
 	if err != nil {
@@ -89,7 +89,7 @@ func (fos *fileObjectStorage) listPrefix(prefix string) ([]string, error) {
 	return files, err
 }
 
-func (fos *fileObjectStorage) read(name string) ([]byte, error) {
+func (fos *fileObjectStorage) Read(name string) ([]byte, error) {
 	filename := path.Join(fos.basedir, name)
 	return os.ReadFile(filename)
 }
