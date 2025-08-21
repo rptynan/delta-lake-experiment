@@ -19,6 +19,8 @@ type DeltaLakeClient struct {
 	tx *transaction
 }
 
+// TODO maybe split up this file (types, methods, errors?)
+
 func NewClient(os objectstorage.ObjectStorage) DeltaLakeClient {
 	return DeltaLakeClient{os, nil}
 }
@@ -51,11 +53,16 @@ type Action struct {
 type transaction struct {
 	Id int
 
-	// Both are mapping table name to a list of actions on the table.
+	// Both below are mapping table name to a list of actions on the table.
+	// previousActions is a populated (when we start a new transaction) by reading
+	// through all the existing log files.
 	previousActions map[string][]Action
-	Actions         map[string][]Action
+	// Actions is the set of actions for the current transaction before commit.
+	Actions map[string][]Action
 
 	// Mapping tables to column names.
+	// Add ChangeMetadataActions in either previousActions or Actions, will cause
+	// the columns here to be updated.
 	tables map[string][]string
 
 	// Mapping table name to unflushed/in-memory rows. When rows are flushed, the
@@ -255,4 +262,99 @@ func (d *DeltaLakeClient) flushRows(table string) error {
 	// Don't forget to reset pointer
 	d.tx.unflushedDataPointer[table] = 0
 	return nil
+}
+
+type scanIterator struct {
+	d     *DeltaLakeClient
+	table string
+
+	// First we iterate through unflushed rows.
+	unflushedRows       [DATAOBJECT_SIZE][]any
+	unflushedRowsLen    int
+	unflushedRowPointer int
+
+	// Then we move through each dataobject.
+	dataobjects        []string // Just the names, we fetch next one on calling next()
+	dataobjectsPointer int
+
+	// And within each currentDataobject we iterate through rows.
+	currentDataobject        *dataobject // Content of current dataobject
+	currentDataObjectPointer int
+}
+
+func (d *DeltaLakeClient) Scan(table string) (*scanIterator, error) {
+	if d.tx == nil {
+		return nil, errNoTx
+	}
+
+	// Unflushed rows
+	var unflushedRows [DATAOBJECT_SIZE][]any
+	if unflushedData, ok := d.tx.unflushedData[table]; ok {
+		unflushedRows = *unflushedData
+	}
+	unflushedRowsLen := d.tx.unflushedDataPointer[table]
+
+	// Flushed
+	var dataobjects []string
+	allActions := append(d.tx.previousActions[table], d.tx.Actions[table]...)
+	for _, action := range allActions {
+		if action.AddDataobject != nil {
+			dataobjects = append(dataobjects, action.AddDataobject.Name)
+		}
+	}
+
+	return &scanIterator{
+		d:                d,
+		table:            table,
+		unflushedRows:    unflushedRows,
+		unflushedRowsLen: unflushedRowsLen,
+		dataobjects:      dataobjects,
+	}, nil
+}
+
+func (d *DeltaLakeClient) readDataobject(table, name string) (*dataobject, error) {
+	bytes, err := d.os.Read(fmt.Sprintf("_table_%s_%s", table, name))
+	if err != nil {
+		return nil, err
+	}
+
+	var do dataobject
+	err = json.Unmarshal(bytes, &do)
+	return &do, err
+}
+
+func (si *scanIterator) Next() ([]any, error) {
+	// Unflushed rows first
+	if si.unflushedRowPointer < si.unflushedRowsLen {
+		row := si.unflushedRows[si.unflushedRowPointer]
+		si.unflushedRowPointer++
+		return row, nil
+	}
+
+	// Then flushed rows
+
+	// If we are done with dataobjects, we're done overall.
+	if si.currentDataObjectPointer == len(si.dataobjects) {
+		return nil, nil
+	}
+
+	if si.currentDataobject == nil {
+		object, err := si.d.readDataobject(si.table, si.dataobjects[si.dataobjectsPointer])
+		if err != nil {
+			return nil, err
+		}
+		si.currentDataobject = object
+	}
+
+	if si.currentDataObjectPointer > si.currentDataobject.Len {
+		si.currentDataobject = nil
+		si.dataobjectsPointer++
+		si.currentDataObjectPointer = 0
+
+		return si.Next()
+	}
+
+	row := si.currentDataobject.Data[si.currentDataObjectPointer]
+	si.currentDataObjectPointer++
+	return row, nil
 }
