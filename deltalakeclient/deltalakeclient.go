@@ -334,7 +334,7 @@ func (si *scanIterator) Next() ([]any, error) {
 	// Then flushed rows
 
 	// If we are done with dataobjects, we're done overall.
-	if si.currentDataObjectPointer == len(si.dataobjects) {
+	if si.dataobjectsPointer == len(si.dataobjects) {
 		return nil, nil
 	}
 
