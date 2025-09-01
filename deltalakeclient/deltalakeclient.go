@@ -3,13 +3,16 @@ package deltalakeclient
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/rptynan/delta-lake/objectstorage"
 )
 
 // How many rows to accumulate before flushing
-const DATAOBJECT_SIZE int = 64 * 1024
+// TODO make this configurable, currently set to 10 for easy debugging
+// const DATAOBJECT_SIZE int = 64 * 1024
+const DATAOBJECT_SIZE int = 10
 
 // TODO unexport this?
 type DeltaLakeClient struct {
@@ -26,10 +29,11 @@ func NewClient(os objectstorage.ObjectStorage) DeltaLakeClient {
 }
 
 var (
-	errExistingTx  = fmt.Errorf("Existing Transaction")
-	errNoTx        = fmt.Errorf("No Transaction")
-	errTableExists = fmt.Errorf("Table Exists")
-	errNoTable     = fmt.Errorf("No Such Table")
+	errExistingTx   = fmt.Errorf("Existing Transaction")
+	errNoTx         = fmt.Errorf("No Transaction")
+	errTableExists  = fmt.Errorf("Table Exists")
+	errNoTable      = fmt.Errorf("No Such Table")
+	errTypeMismatch = fmt.Errorf("Type mismatch")
 )
 
 type DataobjectAction struct {
@@ -44,10 +48,9 @@ type ChangeMetadataAction struct {
 
 // an enum, only one field will be non-nil
 type Action struct {
-	AddDataobject  *DataobjectAction
-	ChangeMetadata *ChangeMetadataAction
-	// TODO: Support object removal.
-	// DeleteDataobject *DataobjectAction
+	AddDataobject    *DataobjectAction
+	DeleteDataobject *DataobjectAction
+	ChangeMetadata   *ChangeMetadataAction
 }
 
 type transaction struct {
@@ -111,7 +114,7 @@ func (d *DeltaLakeClient) NewTx() error {
 
 		for table, actions := range oldTx.Actions {
 			for _, action := range actions {
-				if action.AddDataobject != nil {
+				if action.AddDataobject != nil || action.DeleteDataobject != nil {
 					tx.previousActions[table] = append(tx.previousActions[table], action)
 				} else if action.ChangeMetadata != nil {
 					// Store the latest version of
@@ -325,10 +328,14 @@ func (d *DeltaLakeClient) readDataobject(table, name string) (*dataobject, error
 
 func (si *scanIterator) Next() ([]any, error) {
 	// Unflushed rows first
-	if si.unflushedRowPointer < si.unflushedRowsLen {
+	// We have to loop here to find first non-nil row, as DeleteRows tombstones
+	// them to nil.
+	for si.unflushedRowPointer < si.unflushedRowsLen {
 		row := si.unflushedRows[si.unflushedRowPointer]
 		si.unflushedRowPointer++
-		return row, nil
+		if row != nil {
+			return row, nil
+		}
 	}
 
 	// Then flushed rows
@@ -346,15 +353,76 @@ func (si *scanIterator) Next() ([]any, error) {
 		si.currentDataobject = object
 	}
 
-	if si.currentDataObjectPointer > si.currentDataobject.Len {
-		si.currentDataobject = nil
-		si.dataobjectsPointer++
-		si.currentDataObjectPointer = 0
+	// Similar reason for for-loop as above.
+	for {
+		// If we have reached the end of the current dataobject, recurse to get next.
+		if si.currentDataObjectPointer > si.currentDataobject.Len {
+			si.currentDataobject = nil
+			si.dataobjectsPointer++
+			si.currentDataObjectPointer = 0
 
-		return si.Next()
+			return si.Next()
+		}
+
+		row := si.currentDataobject.Data[si.currentDataObjectPointer]
+		si.currentDataObjectPointer++
+		if row != nil {
+			return row, nil
+		}
+	}
+}
+
+type QueryRange struct {
+	// Inclusive
+	Start any
+	End   any
+}
+
+func inRange(columnIndex int, queryRange QueryRange, row []any) (bool, error) {
+	value := row[columnIndex]
+
+	switch start := queryRange.Start.(type) {
+	case int:
+		end, ok1 := queryRange.End.(int)
+		val, ok2 := value.(int)
+		if !ok1 || !ok2 {
+			return false, errTypeMismatch
+		}
+		return start <= val && val <= end, nil
+	case string:
+		end, ok1 := queryRange.End.(string)
+		val, ok2 := value.(string)
+		if !ok1 || !ok2 {
+			return false, errTypeMismatch
+		}
+		return start <= val && val <= end, nil
+	default:
+		return false, errTypeMismatch
+	}
+}
+
+func (d *DeltaLakeClient) DeleteRows(table string, column string, queryRange QueryRange) error {
+	if d.tx == nil {
+		return errExistingTx
 	}
 
-	row := si.currentDataobject.Data[si.currentDataObjectPointer]
-	si.currentDataObjectPointer++
-	return row, nil
+	columnIndex := slices.Index(d.tx.tables[table], column)
+	if columnIndex == -1 {
+		return errNoTable
+	}
+
+	for i := 0; i < d.tx.unflushedDataPointer[table]; i++ {
+		r, err := inRange(columnIndex, queryRange, d.tx.unflushedData[table][i])
+		if err != nil {
+			return err
+		}
+		if r {
+			// Tombstone unflushed rows
+			d.tx.unflushedData[table][i] = nil
+		}
+	}
+
+	// TODO deal with flushed data
+
+	return nil
 }

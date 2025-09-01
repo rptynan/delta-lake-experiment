@@ -170,3 +170,78 @@ func TestConcurrentReaderWithWriterReadsSnapshot(t *testing.T) {
 	utils.AssertEq(err, nil, "could not commit read-only tx")
 	utils.Debug("[c2Reader] Committed tx")
 }
+
+func scanAllRows(c deltalakeclient.DeltaLakeClient) [][]any {
+	// Scan x in read-only transaction
+	it, err := c.Scan("x")
+	utils.AssertEq(err, nil, "could not scan")
+
+	var result [][]any
+	for {
+		row, err := it.Next()
+		utils.AssertEq(err, nil, "could not iterate scan")
+
+		if row == nil {
+			break
+		}
+
+		result = append(result, row)
+	}
+
+	return result
+}
+
+func TestDeletes(t *testing.T) {
+	dir, err := os.MkdirTemp("", "test-database")
+	if err != nil {
+		panic(err)
+	}
+
+	defer os.Remove(dir)
+
+	fos := objectstorage.NewFileObjectStorage(dir)
+	c1Writer := deltalakeclient.NewClient(fos)
+
+	// Setup data
+	err = c1Writer.NewTx()
+	utils.AssertEq(err, nil, "could not start first c1 tx")
+	utils.Debug("[c1] new tx")
+	err = c1Writer.CreateTable("x", []string{"a", "b"})
+	utils.AssertEq(err, nil, "could not create x")
+	utils.Debug("[c1] Created table")
+	err = c1Writer.WriteRow("x", []any{"Joey", 1})
+	utils.AssertEq(err, nil, "could not write row")
+	err = c1Writer.WriteRow("x", []any{"Yue", 2})
+	utils.AssertEq(err, nil, "could not write row")
+	err = c1Writer.WriteRow("x", []any{"Alice", 3})
+	utils.AssertEq(err, nil, "could not write row")
+	utils.Debug("[c1] Wrote rows")
+
+	// Delete rows and check
+	err = c1Writer.DeleteRows("x", "b", deltalakeclient.QueryRange{Start: 2, End: 2})
+	utils.AssertEq(err, nil, "could not delete")
+	utils.Debug("[c1] Deleted row")
+
+	rows := scanAllRows(c1Writer)
+	utils.Debug(rows)
+	utils.AssertEq(len(rows), 2, "result length wrong")
+	utils.AssertEq(rows[0][0], "Joey", "result wrong")
+	utils.AssertEq(rows[1][0], "Alice", "result wrong")
+
+	// Try same after committing
+	err = c1Writer.CommitTx()
+	utils.AssertEq(err, nil, "could not commit tx")
+	utils.Debug("[c1] Committed tx")
+	err = c1Writer.NewTx()
+	utils.AssertEq(err, nil, "could not start second c1 tx")
+	utils.Debug("[c1] new tx")
+
+	err = c1Writer.DeleteRows("x", "b", deltalakeclient.QueryRange{Start: 2, End: 4})
+	utils.AssertEq(err, nil, "could not delete")
+	utils.Debug("[c1] Deleted row")
+
+	rows = scanAllRows(c1Writer)
+	utils.Debug(rows)
+	utils.AssertEq(len(rows), 1, "result length wrong")
+	utils.AssertEq(rows[0][0], "Joey", "result wrong")
+}
