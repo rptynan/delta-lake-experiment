@@ -36,11 +36,13 @@ var (
 	errTypeMismatch = fmt.Errorf("Type mismatch")
 )
 
+// TODO unexport?
 type DataobjectAction struct {
 	Name  string
 	Table string
 }
 
+// TODO Same?
 type ChangeMetadataAction struct {
 	Table   string
 	Columns []string
@@ -225,7 +227,7 @@ func (d *DeltaLakeClient) WriteRow(table string, row []any) error {
 	return nil
 }
 
-type dataobject struct {
+type dataobjectT struct {
 	Table string
 	Name  string
 	Data  [DATAOBJECT_SIZE][]any
@@ -239,28 +241,12 @@ func (d *DeltaLakeClient) flushRows(table string) error {
 		return nil
 	}
 
-	dataobject := dataobject{
-		Table: table,
-		Name:  uuid.New().String(),
-		Data:  *d.tx.unflushedData[table],
-		Len:   pointer,
-	}
-	serialisedbytes, err := json.Marshal(dataobject)
+	addDataobjectAction, err := d.writeDataObject(table, d.tx.unflushedData[table], d.tx.unflushedDataPointer[table])
 	if err != nil {
 		return err
 	}
 
-	filename := fmt.Sprintf("_table_%s_%s", table, dataobject.Name)
-	err = d.os.PutIfAbsent(filename, serialisedbytes)
-	if err != nil {
-		return err
-	}
-
-	d.tx.Actions[table] = append(d.tx.Actions[table], Action{
-		AddDataobject: &DataobjectAction{
-			Name: dataobject.Name, Table: table,
-		},
-	})
+	d.tx.Actions[table] = append(d.tx.Actions[table], addDataobjectAction)
 
 	// Don't forget to reset pointer
 	d.tx.unflushedDataPointer[table] = 0
@@ -281,7 +267,7 @@ type scanIterator struct {
 	dataobjectsPointer int
 
 	// And within each currentDataobject we iterate through rows.
-	currentDataobject        *dataobject // Content of current dataobject
+	currentDataobject        *dataobjectT // Content of current dataobject
 	currentDataObjectPointer int
 }
 
@@ -298,30 +284,24 @@ func (d *DeltaLakeClient) Scan(table string) (*scanIterator, error) {
 	unflushedRowsLen := d.tx.unflushedDataPointer[table]
 
 	// Flushed
-	var dataobjects []string
-	allActions := append(d.tx.previousActions[table], d.tx.Actions[table]...)
-	for _, action := range allActions {
-		if action.AddDataobject != nil {
-			dataobjects = append(dataobjects, action.AddDataobject.Name)
-		}
-	}
+	extantDataobjects := d.listExtantDataobjects(table)
 
 	return &scanIterator{
 		d:                d,
 		table:            table,
 		unflushedRows:    unflushedRows,
 		unflushedRowsLen: unflushedRowsLen,
-		dataobjects:      dataobjects,
+		dataobjects:      extantDataobjects,
 	}, nil
 }
 
-func (d *DeltaLakeClient) readDataobject(table, name string) (*dataobject, error) {
+func (d *DeltaLakeClient) readDataobject(table, name string) (*dataobjectT, error) {
 	bytes, err := d.os.Read(fmt.Sprintf("_table_%s_%s", table, name))
 	if err != nil {
 		return nil, err
 	}
 
-	var do dataobject
+	var do dataobjectT
 	err = json.Unmarshal(bytes, &do)
 	return &do, err
 }
@@ -378,15 +358,30 @@ type QueryRange struct {
 	End   any
 }
 
+// Because of JSON, all our numbers come back as floats. We are just going to assume everything is an int for now.
+func asInt(x any) (int, error) {
+	switch v := x.(type) {
+	case int:
+		return v, nil
+	case float64:
+		return int(v), nil
+	default:
+		return 0, errTypeMismatch
+	}
+}
+
 func inRange(columnIndex int, queryRange QueryRange, row []any) (bool, error) {
 	value := row[columnIndex]
 
 	switch start := queryRange.Start.(type) {
 	case int:
 		end, ok1 := queryRange.End.(int)
-		val, ok2 := value.(int)
-		if !ok1 || !ok2 {
+		if !ok1 {
 			return false, errTypeMismatch
+		}
+		val, err := asInt(value)
+		if err != nil {
+			return false, err
 		}
 		return start <= val && val <= end, nil
 	case string:
@@ -411,6 +406,7 @@ func (d *DeltaLakeClient) DeleteRows(table string, column string, queryRange Que
 		return errNoTable
 	}
 
+	// Unflushed data
 	for i := 0; i < d.tx.unflushedDataPointer[table]; i++ {
 		r, err := inRange(columnIndex, queryRange, d.tx.unflushedData[table][i])
 		if err != nil {
@@ -422,7 +418,108 @@ func (d *DeltaLakeClient) DeleteRows(table string, column string, queryRange Que
 		}
 	}
 
-	// TODO deal with flushed data
+	// Flushed data
+	// We are doing copy-on-write, so we find any dataobjects that have matching
+	// rows, mark them as deleted and then rewrite those objects without said rows.
+	extantDataobjects := d.listExtantDataobjects(table)
+
+	var filteredRows [DATAOBJECT_SIZE][]any
+	for _, dataobject := range extantDataobjects {
+		filteredRowsPointer := 0
+
+		dataobject, err := d.readDataobject(table, dataobject)
+		if err != nil {
+			return err
+		}
+
+		for i := 0; i < dataobject.Len; i++ {
+			row := dataobject.Data[i]
+			// Currently flushing data doesn't filter nils. TODO
+			if len(row) == 0 {
+				filteredRowsPointer++
+				continue
+			}
+
+			r, err := inRange(columnIndex, queryRange, row)
+			if err != nil {
+				return err
+			}
+			if !r {
+				filteredRows[filteredRowsPointer] = row
+				filteredRowsPointer++
+			}
+		}
+
+		// If this is true, we know we have filtered out some rows, so we need to delete the old dataobject and write a new
+		// one with the contents of our filtered rows array.
+		if filteredRowsPointer != dataobject.Len {
+			addDataobjectAction, err := d.writeDataObject(table, &filteredRows, filteredRowsPointer)
+			if err != nil {
+				return err
+			}
+
+			d.tx.Actions[table] = append(d.tx.Actions[table],
+				addDataobjectAction,
+				Action{
+					DeleteDataobject: &DataobjectAction{
+						Name: dataobject.Name, Table: table,
+					},
+				},
+			)
+		}
+	}
 
 	return nil
+}
+
+// For a given table, lists all dataobjects that have not been deleted.
+func (d *DeltaLakeClient) listExtantDataobjects(table string) []string {
+	allActions := append(d.tx.previousActions[table], d.tx.Actions[table]...)
+
+	deletedDataobjectsSet := make(map[string]struct{})
+	for _, action := range allActions {
+		if action.DeleteDataobject != nil {
+			deletedDataobjectsSet[action.DeleteDataobject.Name] = struct{}{}
+		}
+	}
+
+	var extantDataobjects []string
+	for _, action := range allActions {
+		if action.AddDataobject != nil {
+			if _, deleted := deletedDataobjectsSet[action.AddDataobject.Name]; !deleted {
+				extantDataobjects = append(extantDataobjects, action.AddDataobject.Name)
+			}
+		}
+	}
+	return extantDataobjects
+}
+
+// Writes the rows provided (filtering out nils) and returns the AddDataobject action for the created file. Callers are
+// responsible for putting that action into the transaction.
+func (d *DeltaLakeClient) writeDataObject(table string, rows *[DATAOBJECT_SIZE][]any, rowsLen int) (Action, error) {
+	newDataobject := dataobjectT{
+		Table: table,
+		Name:  uuid.New().String(),
+		Data:  *rows,
+		Len:   rowsLen,
+	}
+
+	// TODO filter nils here
+
+	serialisedbytes, err := json.Marshal(newDataobject)
+	if err != nil {
+		return Action{}, err
+	}
+
+	filename := fmt.Sprintf("_table_%s_%s", table, newDataobject.Name)
+	err = d.os.PutIfAbsent(filename, serialisedbytes)
+	if err != nil {
+		return Action{}, err
+	}
+
+	return Action{
+		AddDataobject: &DataobjectAction{
+			Name: newDataobject.Name, Table: table,
+		},
+	}, nil
 }

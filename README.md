@@ -24,5 +24,8 @@ General features ideas:
 Known problems:
 
 - If you call flushRows with less than DATAOBJECT_SIZE in the unflushed rows, you'll save lots of nulls to disk. This
-  also includes the current implementation of deletion tombstones (which are just nils).
+  also includes the current implementation of deletion tombstones (which are just nils). Removing these would simplify a
+  lot of scan rows and delete rows.
 - Schema changes aren't great. E.g. Look at inRange for deletions, if the schema has been changed to add columns and then a delete is done on one of the new columns, any flushed rows won't have values for those columns and it explodes.
+- Similarly types are a problem. Serialising anys to JSON means all our numbers come back as floats, so for now there is
+  just a cast in there to make them all ints.

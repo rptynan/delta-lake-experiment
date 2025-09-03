@@ -228,7 +228,7 @@ func TestDeletes(t *testing.T) {
 	utils.AssertEq(rows[0][0], "Joey", "result wrong")
 	utils.AssertEq(rows[1][0], "Alice", "result wrong")
 
-	// Try same after committing
+	// Try same after committing the row to be deleted
 	err = c1Writer.CommitTx()
 	utils.AssertEq(err, nil, "could not commit tx")
 	utils.Debug("[c1] Committed tx")
@@ -239,6 +239,15 @@ func TestDeletes(t *testing.T) {
 	err = c1Writer.DeleteRows("x", "b", deltalakeclient.QueryRange{Start: 2, End: 4})
 	utils.AssertEq(err, nil, "could not delete")
 	utils.Debug("[c1] Deleted row")
+
+	rows = scanAllRows(c1Writer)
+	utils.Debug(rows)
+	utils.AssertEq(len(rows), 1, "result length wrong")
+	utils.AssertEq(rows[0][0], "Joey", "result wrong")
+
+	// And lets flush all those rows too just to make sure
+	c1Writer.CommitTx()
+	c1Writer.NewTx()
 
 	rows = scanAllRows(c1Writer)
 	utils.Debug(rows)
