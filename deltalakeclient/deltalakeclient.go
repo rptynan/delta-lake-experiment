@@ -14,7 +14,6 @@ import (
 // const DATAOBJECT_SIZE int = 64 * 1024
 const DATAOBJECT_SIZE int = 10
 
-// TODO unexport this?
 type DeltaLakeClient struct {
 	os objectstorage.ObjectStorage
 	// Current transaction, if any. Only one transaction per client at a time. All
@@ -36,23 +35,21 @@ var (
 	errTypeMismatch = fmt.Errorf("Type mismatch")
 )
 
-// TODO unexport?
-type DataobjectAction struct {
+type dataobjectAction struct {
 	Name  string
 	Table string
 }
 
-// TODO Same?
-type ChangeMetadataAction struct {
+type changeMetadataAction struct {
 	Table   string
 	Columns []string
 }
 
 // an enum, only one field will be non-nil
 type Action struct {
-	AddDataobject    *DataobjectAction
-	DeleteDataobject *DataobjectAction
-	ChangeMetadata   *ChangeMetadataAction
+	AddDataobject    *dataobjectAction
+	DeleteDataobject *dataobjectAction
+	ChangeMetadata   *changeMetadataAction
 }
 
 type transaction struct {
@@ -192,7 +189,7 @@ func (d *DeltaLakeClient) CreateTable(table string, columns []string) error {
 
 	// And also add it to the action history for future transactions.
 	d.tx.Actions[table] = append(d.tx.Actions[table], Action{
-		ChangeMetadata: &ChangeMetadataAction{
+		ChangeMetadata: &changeMetadataAction{
 			Table:   table,
 			Columns: columns,
 		},
@@ -241,7 +238,7 @@ func (d *DeltaLakeClient) flushRows(table string) error {
 		return nil
 	}
 
-	addDataobjectAction, err := d.writeDataObject(table, d.tx.unflushedData[table], d.tx.unflushedDataPointer[table])
+	addDataobjectAction, err := d.writeDataObject(table, d.tx.unflushedData[table])
 	if err != nil {
 		return err
 	}
@@ -434,11 +431,6 @@ func (d *DeltaLakeClient) DeleteRows(table string, column string, queryRange Que
 
 		for i := 0; i < dataobject.Len; i++ {
 			row := dataobject.Data[i]
-			// Currently flushing data doesn't filter nils. TODO
-			if len(row) == 0 {
-				filteredRowsPointer++
-				continue
-			}
 
 			r, err := inRange(columnIndex, queryRange, row)
 			if err != nil {
@@ -453,7 +445,7 @@ func (d *DeltaLakeClient) DeleteRows(table string, column string, queryRange Que
 		// If this is true, we know we have filtered out some rows, so we need to delete the old dataobject and write a new
 		// one with the contents of our filtered rows array.
 		if filteredRowsPointer != dataobject.Len {
-			addDataobjectAction, err := d.writeDataObject(table, &filteredRows, filteredRowsPointer)
+			addDataobjectAction, err := d.writeDataObject(table, &filteredRows)
 			if err != nil {
 				return err
 			}
@@ -461,7 +453,7 @@ func (d *DeltaLakeClient) DeleteRows(table string, column string, queryRange Que
 			d.tx.Actions[table] = append(d.tx.Actions[table],
 				addDataobjectAction,
 				Action{
-					DeleteDataobject: &DataobjectAction{
+					DeleteDataobject: &dataobjectAction{
 						Name: dataobject.Name, Table: table,
 					},
 				},
@@ -496,15 +488,23 @@ func (d *DeltaLakeClient) listExtantDataobjects(table string) []string {
 
 // Writes the rows provided (filtering out nils) and returns the AddDataobject action for the created file. Callers are
 // responsible for putting that action into the transaction.
-func (d *DeltaLakeClient) writeDataObject(table string, rows *[DATAOBJECT_SIZE][]any, rowsLen int) (Action, error) {
+func (d *DeltaLakeClient) writeDataObject(table string, rows *[DATAOBJECT_SIZE][]any) (Action, error) {
+	// We filter here because of deletes using nils as tombstones in the unflushed data.
+	var filteredRows [DATAOBJECT_SIZE][]any
+	filteredRowsPointer := 0
+	for _, row := range rows {
+		if row != nil {
+			filteredRows[filteredRowsPointer] = row
+			filteredRowsPointer++
+		}
+	}
+
 	newDataobject := dataobjectT{
 		Table: table,
 		Name:  uuid.New().String(),
-		Data:  *rows,
-		Len:   rowsLen,
+		Data:  filteredRows,
+		Len:   filteredRowsPointer,
 	}
-
-	// TODO filter nils here
 
 	serialisedbytes, err := json.Marshal(newDataobject)
 	if err != nil {
@@ -518,7 +518,7 @@ func (d *DeltaLakeClient) writeDataObject(table string, rows *[DATAOBJECT_SIZE][
 	}
 
 	return Action{
-		AddDataobject: &DataobjectAction{
+		AddDataobject: &dataobjectAction{
 			Name: newDataobject.Name, Table: table,
 		},
 	}, nil
