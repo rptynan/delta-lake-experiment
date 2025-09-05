@@ -1,6 +1,10 @@
 package deltalakeclient
 
-import "slices"
+import (
+	"slices"
+
+	"github.com/rptynan/delta-lake/utils"
+)
 
 func (d *DeltaLakeClient) CreateTable(table string, columns []string) error {
 	if d.tx == nil {
@@ -57,18 +61,6 @@ type QueryRange struct {
 	End   any
 }
 
-// Because of JSON, all our numbers come back as floats. We are just going to assume everything is an int for now.
-func asInt(x any) (int, error) {
-	switch v := x.(type) {
-	case int:
-		return v, nil
-	case float64:
-		return int(v), nil
-	default:
-		return 0, errTypeMismatch
-	}
-}
-
 func inRange(columnIndex int, queryRange QueryRange, row []any) (bool, error) {
 	value := row[columnIndex]
 
@@ -78,7 +70,7 @@ func inRange(columnIndex int, queryRange QueryRange, row []any) (bool, error) {
 		if !ok1 {
 			return false, errTypeMismatch
 		}
-		val, err := asInt(value)
+		val, err := utils.AsInt(value)
 		if err != nil {
 			return false, err
 		}
@@ -122,11 +114,11 @@ func (d *DeltaLakeClient) DeleteRows(table string, column string, queryRange Que
 	// rows, mark them as deleted and then rewrite those objects without said rows.
 	extantDataobjects := d.listExtantDataobjects(table)
 
-	var filteredRows [DATAOBJECT_SIZE][]any
-	for _, dataobject := range extantDataobjects {
+	for _, dataobjectAction := range extantDataobjects {
+		var filteredRows [DATAOBJECT_SIZE][]any
 		filteredRowsPointer := 0
 
-		dataobject, err := d.readDataobject(table, dataobject)
+		dataobject, err := d.readDataobject(table, dataobjectAction.Name)
 		if err != nil {
 			return err
 		}
@@ -147,7 +139,9 @@ func (d *DeltaLakeClient) DeleteRows(table string, column string, queryRange Que
 		// If this is true, we know we have filtered out some rows, so we need to delete the old dataobject and write a new
 		// one with the contents of our filtered rows array.
 		if filteredRowsPointer != dataobject.Len {
-			addDataobjectAction, err := d.writeDataObject(table, &filteredRows)
+			// We provide the TxId of the dataobject we are deleting, so when we are reading these later on, the re-written
+			// rows will be ordered chronologically in the same place as the original ones.
+			addDataobjectAction, err := d.writeDataObject(table, &filteredRows, dataobjectAction.TxId)
 			if err != nil {
 				return err
 			}
@@ -155,8 +149,9 @@ func (d *DeltaLakeClient) DeleteRows(table string, column string, queryRange Que
 			d.tx.Actions[table] = append(d.tx.Actions[table],
 				addDataobjectAction,
 				Action{
-					DeleteDataobject: &dataobjectAction{
-						Name: dataobject.Name, Table: table,
+					DeleteDataobject: &dataobjectActionT{
+						// However note the delete still has the current txId.
+						Name: dataobject.Name, Table: table, TxId: d.tx.Id,
 					},
 				},
 			)

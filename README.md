@@ -7,19 +7,35 @@ golang.
 
 - Deletion is implemented as copy-on-write.
 
+## Testing
+
+Standard go commands for building and testing (`go build`, `go test`).
+
+Other useful commands:
+
+```
+# To show debug logs:
+$ go test -v -- --debug
+# If you want to redirect the local files (comment our os.Remove(dir) in the test too):
+$ TMPDIR=. go test -v -- --debug
+# Run a specific test:
+$ go test -v -run Random
+```
+
 ## TODOs
 
 General features ideas:
 
+- [x] Implement deletes.
 - [ ] Set up minio with some latency to mimic S3 obj storage, write an object storage layer for it.
-- [x] Implement deletes
-- [ ] Add compaction of dataobject files
+- [ ] Implement primary keys/conditional updates (with built-in deduplication).
+- [ ] Add compaction of dataobject files.
 - [ ] Try something other than JSON serialisation (pluggable?). Real delta lake: "store data in-memory in Apache Arrow
       format, and write to disk as Parquet. "
-- [ ] Set up containers to run as server
+- [ ] Set up containers to run as server.
 - [ ] Benchmark, perf ideas:
-  - [ ] Column stats (bloom filter) on each data object
-  - [ ] (Deletion) Implement deletion vectors instead of copy-on-write
+  - [ ] Column stats (bloom filter) on each data object.
+  - [ ] (Deletion) Implement deletion vectors instead of copy-on-write.
 
 Known problems:
 

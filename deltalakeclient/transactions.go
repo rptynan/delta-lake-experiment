@@ -5,9 +5,15 @@ import (
 	"fmt"
 )
 
-type dataobjectAction struct {
+type dataobjectActionT struct {
 	Name  string
 	Table string
+	// Should generally match the transaction file this is a part of, but may be changed if we are
+	// doing a copy on write and need to indicate that this data is a rewrite of a previous
+	// transation.
+	// This is used to preserve order of rows after we do copy-on-writes for deletes. I'm not sure if
+	// this how delta lake does it, can't find much easily online.
+	TxId int
 }
 
 type changeMetadataAction struct {
@@ -17,8 +23,8 @@ type changeMetadataAction struct {
 
 // an enum, only one field will be non-nil
 type Action struct {
-	AddDataobject    *dataobjectAction
-	DeleteDataobject *dataobjectAction
+	AddDataobject    *dataobjectActionT
+	DeleteDataobject *dataobjectActionT
 	ChangeMetadata   *changeMetadataAction
 }
 
@@ -50,7 +56,7 @@ func (d *DeltaLakeClient) NewTx() error {
 	}
 
 	logPrefix := "_log_"
-	txLogFilenames, err := d.os.ListPrefix(logPrefix)
+	txLogFilenames, err := d.os.ListPrefixOrdered(logPrefix)
 	if err != nil {
 		return err
 	}
@@ -73,12 +79,9 @@ func (d *DeltaLakeClient) NewTx() error {
 		if err != nil {
 			return err
 		}
-		// Transaction metadata files are sorted
-		// lexicographically so that the most recent
-		// transaction (i.e. the one with the largest
-		// transaction id) will be last and tx.Id will end up
-		// 1 greater than the most recent transaction ID we
-		// see on disk.
+		// Transaction metadata files are sorted lexicographically so that the most recent transaction
+		// (i.e. the one with the largest transaction id) will be last and tx.Id will end up 1 greater
+		// than the most recent transaction ID we see on disk.
 		tx.Id = oldTx.Id + 1
 
 		for table, actions := range oldTx.Actions {
@@ -86,9 +89,7 @@ func (d *DeltaLakeClient) NewTx() error {
 				if action.AddDataobject != nil || action.DeleteDataobject != nil {
 					tx.previousActions[table] = append(tx.previousActions[table], action)
 				} else if action.ChangeMetadata != nil {
-					// Store the latest version of
-					// each table in memory for
-					// easy lookup.
+					// Store the latest version of each table in memory for easy lookup.
 					mtd := action.ChangeMetadata
 					tx.tables[table] = mtd.Columns
 				} else {
@@ -152,7 +153,7 @@ func (d *DeltaLakeClient) flushRows(table string) error {
 		return nil
 	}
 
-	addDataobjectAction, err := d.writeDataObject(table, d.tx.unflushedData[table])
+	addDataobjectAction, err := d.writeDataObject(table, d.tx.unflushedData[table], d.tx.Id)
 	if err != nil {
 		return err
 	}

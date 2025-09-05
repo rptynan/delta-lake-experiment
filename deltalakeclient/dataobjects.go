@@ -3,6 +3,7 @@ package deltalakeclient
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"github.com/google/uuid"
 )
@@ -27,7 +28,9 @@ func (d *DeltaLakeClient) readDataobject(table, name string) (*dataobjectT, erro
 
 // Writes the rows provided (filtering out nils) and returns the AddDataobject action for the created file. Callers are
 // responsible for putting that action into the transaction.
-func (d *DeltaLakeClient) writeDataObject(table string, rows *[DATAOBJECT_SIZE][]any) (Action, error) {
+// For most purposes, txId can be the current transaction ID (i.e. d.tx.Id), however in some cases (such as
+// copy-on-write, the caller provides a different value).
+func (d *DeltaLakeClient) writeDataObject(table string, rows *[DATAOBJECT_SIZE][]any, txId int) (Action, error) {
 	// We filter here because of deletes using nils as tombstones in the unflushed data.
 	var filteredRows [DATAOBJECT_SIZE][]any
 	filteredRowsPointer := 0
@@ -57,14 +60,16 @@ func (d *DeltaLakeClient) writeDataObject(table string, rows *[DATAOBJECT_SIZE][
 	}
 
 	return Action{
-		AddDataobject: &dataobjectAction{
-			Name: newDataobject.Name, Table: table,
+		AddDataobject: &dataobjectActionT{
+			Name: newDataobject.Name, Table: table, TxId: txId,
 		},
 	}, nil
 }
 
 // For a given table, lists all dataobjects that have not been deleted.
-func (d *DeltaLakeClient) listExtantDataobjects(table string) []string {
+// This will return the dataobjects in chronological order.
+// The returned slice contains dataobjectActions for all adds that have not been deleted.
+func (d *DeltaLakeClient) listExtantDataobjects(table string) []*dataobjectActionT {
 	allActions := append(d.tx.previousActions[table], d.tx.Actions[table]...)
 
 	deletedDataobjectsSet := make(map[string]struct{})
@@ -74,13 +79,16 @@ func (d *DeltaLakeClient) listExtantDataobjects(table string) []string {
 		}
 	}
 
-	var extantDataobjects []string
+	var extantDataobjects []*dataobjectActionT
 	for _, action := range allActions {
 		if action.AddDataobject != nil {
 			if _, deleted := deletedDataobjectsSet[action.AddDataobject.Name]; !deleted {
-				extantDataobjects = append(extantDataobjects, action.AddDataobject.Name)
+				extantDataobjects = append(extantDataobjects, action.AddDataobject)
 			}
 		}
 	}
+
+	// Sort by the TxId. See note on that field for why.
+	sort.Slice(extantDataobjects, func(i, j int) bool { return extantDataobjects[i].TxId < extantDataobjects[j].TxId })
 	return extantDataobjects
 }

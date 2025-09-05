@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -64,7 +65,7 @@ func (fos *fileObjectStorage) PutIfAbsent(name string, bytes []byte) error {
 	return nil
 }
 
-func (fos *fileObjectStorage) ListPrefix(prefix string) ([]string, error) {
+func (fos *fileObjectStorage) ListPrefixOrdered(prefix string) ([]string, error) {
 	dir := path.Join(fos.basedir)
 	f, err := os.Open(dir)
 	if err != nil {
@@ -86,6 +87,9 @@ func (fos *fileObjectStorage) ListPrefix(prefix string) ([]string, error) {
 		}
 	}
 	err = f.Close()
+
+	// Readdirnames gives no guarantee of order
+	sort.Strings(files)
 	return files, err
 }
 
